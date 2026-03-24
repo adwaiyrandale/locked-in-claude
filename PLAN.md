@@ -174,8 +174,8 @@ Each index entry now stores a SHA-256 checksum of the memories.json file. The va
 | **Command** | **Purpose** | **Key Flags** |
 |-------------|-------------|---------------|
 | bin/init.py | Initialize or validate system | `--force`, `--validate-only` |
-| bin/store.py | Store longterm or transient memory | `--project`, `--type`, `--auto`, `--title`, `--content`, `--keywords`, `--tags`, `--category`, `--dry-run` |
-| bin/query.py | Retrieve memories | `--project`, `--keywords`, `--type`, `--recent`, `--since`, `--tag`, `--session`, `--full`, `--format`, `--dry-run` |
+| bin/store.py | Store longterm or transient memory | `--project`, `--type`, `--auto`, `--stdin`, `--title`, `--content`, `--keywords`, `--tags`, `--category`, `--no-fuzzy-dedup`, `--dry-run` |
+| bin/query.py | Retrieve memories | `--project`, `--keywords`, `--type`, `--recent`, `--since`, `--tag`, `--session`, `--full`, `--summary`, `--limit`, `--format`, `--dry-run` |
 | bin/archive.py | Archive current session | `--project` |
 | bin/list.py | Discover all projects | `--type`, `--format` |
 | bin/maintain.py | Index rebuild, validate, vacuum | `--rebuild`, `--validate`, `--vacuum`, `--older-than` |
@@ -235,10 +235,35 @@ def validate_and_heal(base_dir):
     write_json(index_path, index)
     print(f"STATUS:OK validate complete. healed={len(stale)}")
     return True
-```
-### 4.3 store.py — Storage with Locking & Deduplication
-```python
-def store_longterm(project, title, content, keywords, category, tags=[]):
+
+def write_json(path, data):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+
+def read_json(path):
+    with open(path, "r") as f:
+        return json.load(f)
+
+def store(project, title, content, keywords, category, tags=[], auto=False, no_fuzzy_dedup=False, stdin=False):
+    """Main store entry point with auto-detection and stdin support."""
+    # Read content from stdin if requested
+    if stdin:
+        content = sys.stdin.read()
+    
+    # Determine memory type
+    if auto:
+        memory_type = auto_detect_type(content, title, keywords)
+    else:
+        memory_type = "longterm"
+    
+    if memory_type == "longterm":
+        return store_longterm(project, title, content, keywords, category, tags, no_fuzzy_dedup)
+    else:
+        return store_transient(project, task=content, status="pending", priority="medium", tags=tags)
+
+def store_longterm(project, title, content, keywords, category, tags=[], no_fuzzy_dedup=False):
     lock_file = os.path.join(base_dir, "locks", f"{project}.lock")
     
     with exclusive_lock(lock_file):  # fcntl.flock(LOCK_EX)
@@ -250,11 +275,17 @@ def store_longterm(project, title, content, keywords, category, tags=[]):
             print("STATUS:SKIP duplicate content hash")
             return None
         
-        # Step 2: Fuzzy dedup via Jaccard on keywords
-        new_kws = set(normalize_keywords(keywords))
-        for existing in data["entries"]:
-            existing_kws = set(existing["keywords"])
-            jaccard = len(new_kws & existing_kws) / len(new_kws | existing_kws)
+        # Step 2: Fuzzy dedup via Jaccard on keywords (skip if no_fuzzy_dedup)
+        if not no_fuzzy_dedup:
+            new_kws = set(normalize_keywords(keywords))
+            for existing in data["entries"]:
+                existing_kws = set(existing["keywords"])
+                union = new_kws | existing_kws
+                jaccard = len(new_kws & existing_kws) / len(union) if union else 0.0
+                if jaccard > 0.85:  # Configurable threshold
+                    print(f"STATUS:SKIP near-duplicate (Jaccard={jaccard:.2f})")
+                    return None
+            jaccard = len(new_kws & existing_kws) / len(union) if union else 0.0
             if jaccard > 0.85:  # Configurable threshold
                 print(f"STATUS:SKIP near-duplicate (Jaccard={jaccard:.2f})")
                 return None
@@ -331,13 +362,13 @@ def store(project, title, content, keywords, category, tags=[], auto=False):
 
 ### 4.4 query.py — Retrieval with Fuzzy Matching
 ```python
-def query(project=None, keywords=[], type="both", recent=0, since=None, tag=None, session=False, full=False):
+def query(project=None, keywords=[], type="both", recent=0, since=None, tag=None, session=False, full=False, summary=False, limit=0):
     results = {"longterm": [], "transient": []}
     
     if type in ["longterm", "both"]:
         index = read_json(os.path.join(base_dir, "longterm/index.json"))
         matched = fuzzy_keyword_search(index, project, keywords)
-        results["longterm"] = load_and_filter(matched, keywords, since, tag, full)
+        results["longterm"] = load_and_filter(matched, keywords, since, tag, full, summary)
     
     if type in ["transient", "both"]:
         if session:
@@ -346,12 +377,51 @@ def query(project=None, keywords=[], type="both", recent=0, since=None, tag=None
             # Direct file read — no transient index
             results["transient"] = load_transient_direct(project)
     
-    if recent > 0:
+    # Apply limit (different from recent - no time sorting)
+    if limit > 0:
+        for tier in results:
+            results[tier] = results[tier][:limit]
+    elif recent > 0:
         for tier in results:
             results[tier] = sort_by_time(results[tier])[:recent]
     
     print(f"STATUS:OK longterm={len(results['longterm'])} transient={len(results['transient'])}")
     return results
+
+def load_and_filter(matched_files, keywords, since=None, tag=None, full=False, summary=False):
+    """Load and filter entries from matched files."""
+    entries = []
+    for file_path in matched_files:
+        data = read_json(file_path)
+        for entry in data.get("entries", []):
+            # Apply filters
+            if tag and tag not in entry.get("tags", []):
+                continue
+            if since:
+                entry_time = parse_iso(entry.get("created_at", ""))
+                if entry_time < since:
+                    continue
+            
+            if summary:
+                # Return only id, title, tags, created_at (cheap orientation query)
+                entries.append({
+                    "id": entry["id"],
+                    "title": entry.get("title"),
+                    "tags": entry.get("tags", []),
+                    "created_at": entry.get("created_at")
+                })
+            elif full:
+                entries.append(entry)
+            else:
+                # Preview mode
+                entries.append({
+                    "id": entry["id"],
+                    "title": entry.get("title"),
+                    "preview": entry.get("content", "")[:200],
+                    "tags": entry.get("tags", []),
+                    "created_at": entry.get("created_at")
+                })
+    return entries
 def fuzzy_keyword_search(index, project, keywords):
     if not keywords:
         return get_project_files(index, project)
@@ -445,33 +515,59 @@ def normalize_keywords(keywords):
         if kw in STOP_WORDS:
             continue
         
-        # Apply stemming
-        for suffix in ["ing", "ed", "er", "s", "tion", "ly"]:
-            if kw.endswith(suffix) and len(kw) > 4:
-                stemmed = STEM_MAP.get(kw, kw[:-len(suffix)])
-                kw = STEM_MAP.get(stemmed, stemmed)
-                break
+        # Check STEM_MAP first before generic suffix strip
+        if kw in STEM_MAP:
+            kw = STEM_MAP[kw]
+        else:
+            # Apply stemming only if not in STEM_MAP
+            for suffix in ["ing", "ed", "er", "s", "tion", "ly"]:
+                if kw.endswith(suffix) and len(kw) > 4:
+                    stemmed = kw[:-len(suffix)]
+                    kw = STEM_MAP.get(stemmed, stemmed)
+                    break
         
+        # Final lookup (handles cases where exact key not in map)
         kw = STEM_MAP.get(kw, kw)
         if kw and kw not in result:
             result.append(kw)
     
     return result[:20]  # Max 20
+
+def find_related(entries, keywords, threshold=0.3, max_results=5):
+    """Find related entries based on keyword Jaccard similarity."""
+    new_kws = set(keywords)
+    if not new_kws:
+        return []
+    
+    related = []
+    for entry in entries:
+        existing_kws = set(entry.get("keywords", []))
+        union = new_kws | existing_kws
+        jaccard = len(new_kws & existing_kws) / len(union) if union else 0.0
+        
+        if jaccard >= threshold:
+            related.append(entry["id"])
+    
+    # Return top matches capped at max_results
+    return related[:max_results]
 ```
 ### 5.2 Auto-Keyword Extraction from Content
 ```python
-def extract_keywords(content, max_keywords=10):
+def extract_keywords(content, max_keywords=10, min_freq=2):
     """Extract keywords from content using simple frequency analysis."""
     words = re.findall(r'\b[a-z]{4,}\b', content.lower())
     
-    # Remove stop words
+    # Remove stop words BEFORE frequency counting
     words = [w for w in words if w not in STOP_WORDS]
     
     # Count frequency
     freq = Counter(words)
     
+    # Filter by minimum frequency to remove hapax legomena
+    freq_filtered = {w: c for w, c in freq.items() if c >= min_freq}
+    
     # Return top keywords
-    return [w for w, _ in freq.most_common(max_keywords)]
+    return [w for w, _ in sorted(freq_filtered.items(), key=lambda x: -x[1])[:max_keywords]]
 ```
 ---
 ## 6. Concurrency & Safety Model
@@ -518,7 +614,11 @@ class FileLockWindows:
         return self
     
     def __exit__(self, *args):
-        os.remove(self.lock_path)
+        if os.path.exists(self.lock_path):
+            try:
+                os.remove(self.lock_path)
+            except FileNotFoundError:
+                pass
 def get_file_lock(lock_path):
     """Factory to select correct locking implementation."""
     if os.name == 'nt':
@@ -579,14 +679,14 @@ def validate_index(base_dir):
     """Validate and heal index on startup."""
     index = read_json(os.path.join(base_dir, "longterm/index.json"))
     healed = []
+    stale_projects = set()
     
-    for entry in list(index["entries"]):
+    for entry in index["entries"]:
         file_path = os.path.join(base_dir, "longterm", entry["file"])
         
         # Check if file exists
         if not os.path.exists(file_path):
-            index["entries"].remove(entry)
-            remove_from_keyword_index(index, entry["project"])
+            stale_projects.add(entry["project"])
             healed.append(f"removed stale: {entry['project']}")
             continue
         
@@ -594,16 +694,57 @@ def validate_index(base_dir):
         actual_checksum = sha256_file(file_path)
         if actual_checksum != entry.get("checksum"):
             # File changed — reindex
-            reindex_entry = {
-                "project": entry["project"],
-                "file": entry["file"],
-            }
-            reindex_project_entries(index, reindex_entry)
+            reindex_project_entries(index, entry["project"])
             healed.append(f"reindexed: {entry['project']}")
+    
+    # Filter out stale entries in one pass (O(n) instead of O(n²))
+    index["entries"] = [e for e in index["entries"] if e["project"] not in stale_projects]
+    
+    # Remove keyword index entries for stale projects
+    for proj in stale_projects:
+        if proj in index.get("keyword_index", {}):
+            del index["keyword_index"][proj]
     
     write_json(os.path.join(base_dir, "longterm/index.json"), index)
     return healed
-```
+
+def reindex_project_entries(index, project):
+    """Rebuild all keyword index entries for a single project."""
+    memories_file = os.path.join(base_dir, "longterm/projects", project, "memories.json")
+    if not os.path.exists(memories_file):
+        return
+    
+    data = read_json(memories_file)
+    entries = data.get("entries", [])
+    
+    # Rebuild keyword index for this project
+    project_keywords = set()
+    for entry in entries:
+        for kw in entry.get("keywords", []):
+            kw_lower = kw.lower()
+            project_keywords.add(kw_lower)
+            
+            # Add to keyword index
+            if kw_lower not in index.get("keyword_index", {}):
+                index["keyword_index"][kw_lower] = []
+            
+            # Add entry reference (avoid duplicates)
+            existing_refs = index["keyword_index"][kw_lower]
+            if not any(r.get("project") == project for r in existing_refs):
+                existing_refs.append({
+                    "project": project,
+                    "file": f"projects/{project}/memories.json"
+                })
+    
+    # Update project entry in index
+    for entry in index["entries"]:
+        if entry["project"] == project:
+            entry["keywords"] = list(project_keywords)
+            entry["entry_count"] = len(entries)
+            entry["checksum"] = sha256_file(memories_file)
+            entry["last_updated"] = data.get("last_updated", now())
+            break
+
 ---
 ## 10. Query Output Formats
 ### 10.1 JSON Format (Default)
@@ -709,7 +850,7 @@ python3 ~/.locked-in-claude/bin/query.py \
   --project <name> --since 2h --recent 10
 ### Store context
 python3 ~/.locked-in-claude/bin/store.py \
-  --project <name> --type longterm \
+  --project <name> --auto \
   --title "Description" --content "Full context..." \
   --keywords "term1,term2" --tags "#architecture,#decision"
 ### Check active session
