@@ -248,49 +248,38 @@ def read_json(path):
     with open(path, "r") as f:
         return json.load(f)
 
-def store(project, title, content, keywords, category, tags=[], auto=False, no_fuzzy_dedup=False, stdin=False):
-    """Main store entry point with auto-detection and stdin support."""
-    # Read content from stdin if requested
-    if stdin:
-        content = sys.stdin.read()
-    
-    # Determine memory type
-    if auto:
-        memory_type = auto_detect_type(content, title, keywords)
-    else:
-        memory_type = "longterm"
-    
-    if memory_type == "longterm":
-        return store_longterm(project, title, content, keywords, category, tags, no_fuzzy_dedup)
-    else:
-        return store_transient(project, task=content, status="pending", priority="medium", tags=tags)
+
 
 def store_longterm(project, title, content, keywords, category, tags=[], no_fuzzy_dedup=False):
+    """Store longterm memory with deduplication and indexing."""
+    base_dir = os.path.expanduser("~/.locked-in-claude")
     lock_file = os.path.join(base_dir, "locks", f"{project}.lock")
+    lock_fd = get_lock(lock_file)
     
-    with exclusive_lock(lock_file):  # fcntl.flock(LOCK_EX)
-        data = load_or_create_memories(project)
+    try:
+        proj_dir = os.path.join(base_dir, "longterm", "projects", project)
+        os.makedirs(proj_dir, exist_ok=True)
+        memories_file = os.path.join(proj_dir, "memories.json")
+        
+        data = load_or_create_memories(project, "longterm")
         
         # Step 1: Exact dedup via SHA-256
         content_hash = hashlib.sha256(content.encode()).hexdigest()
-        if content_hash in {e["content_hash"].replace("sha256:", "") for e in data["entries"]}:
+        if content_hash in {e["content_hash"].replace("sha256:", "") for e in data.get("entries", [])}:
             print("STATUS:SKIP duplicate content hash")
             return None
         
         # Step 2: Fuzzy dedup via Jaccard on keywords (skip if no_fuzzy_dedup)
         if not no_fuzzy_dedup:
             new_kws = set(normalize_keywords(keywords))
-            for existing in data["entries"]:
-                existing_kws = set(existing["keywords"])
+            for existing in data.get("entries", []):
+                existing_kws = set(existing.get("keywords", []))
                 union = new_kws | existing_kws
-                jaccard = len(new_kws & existing_kws) / len(union) if union else 0.0
-                if jaccard > 0.85:  # Configurable threshold
-                    print(f"STATUS:SKIP near-duplicate (Jaccard={jaccard:.2f})")
-                    return None
-            jaccard = len(new_kws & existing_kws) / len(union) if union else 0.0
-            if jaccard > 0.85:  # Configurable threshold
-                print(f"STATUS:SKIP near-duplicate (Jaccard={jaccard:.2f})")
-                return None
+                if union:
+                    jaccard = len(new_kws & existing_kws) / len(union)
+                    if jaccard > 0.85:
+                        print(f"STATUS:SKIP near-duplicate (Jaccard={jaccard:.2f})")
+                        return None
         
         # Step 3: Build entry
         cleaned_kws = normalize_keywords(keywords + extract_keywords(content))
@@ -303,21 +292,26 @@ def store_longterm(project, title, content, keywords, category, tags=[], no_fuzz
             "tags": [t.lower() for t in tags if t.startswith("#")],
             "related_entries": [],
             "content_hash": f"sha256:{content_hash}",
-            "keyword_fingerprint": base64.b64encode(",".join(sorted(cleaned_kws)).encode()).decode(),
-            "created_at": now()
+            "created_at": now(),
+            "updated_at": now()
         }
         
         # Step 4: Auto-populate related_entries
-        entry["related_entries"] = find_related(data["entries"], cleaned_kws, threshold=0.3)
+        entry["related_entries"] = find_related(data.get("entries", []), cleaned_kws, threshold=0.3, max_results=5)
         
+        if "entries" not in data:
+            data["entries"] = []
         data["entries"].append(entry)
         data["last_updated"] = now()
         
         write_json(memories_file, data)
-        update_index_incremental(project, entry)
+        update_index_incremental(project, cleaned_kws)
         
         print(f"STATUS:OK id={entry['id']}")
         return entry["id"]
+    
+    finally:
+        release_lock(lock_fd)
 
 def auto_detect_type(content, title, keywords):
     """Auto-detect memory type based on content heuristics."""
@@ -348,18 +342,6 @@ def auto_detect_type(content, title, keywords):
         return "transient"
     else:
         return "longterm"  # Default to longterm
-
-def store(project, title, content, keywords, category, tags=[], auto=False):
-    """Main store entry point with auto-detection."""
-    if auto:
-        memory_type = auto_detect_type(content, title, keywords)
-    else:
-        memory_type = "longterm"  # Default
-    
-    if memory_type == "longterm":
-        return store_longterm(project, title, content, keywords, category, tags)
-    else:
-        return store_transient(project, task=content, status="pending", priority="medium", tags=tags)
 ```
 
 ### 4.4 query.py — Retrieval with Fuzzy Matching
@@ -1146,7 +1128,7 @@ LockedInClaude does not enforce the no-secrets policy programmatically. It is th
 - [ ] Integration test: v1.0 memories file — verify migration runs automatically
 - [ ] Integration test: 1000-entry project — verify query latency < 50ms
 ---
-## Appendix A: Entry Types
+## Appendix Reference: Entry Types
 | **Type** | **Use For** |
 |----------|-------------|
 | context | General project context, background information |
@@ -1156,7 +1138,7 @@ LockedInClaude does not enforce the no-secrets policy programmatically. It is th
 | note | Free-form notes, observations, reminders |
 | decision | Architectural or design decisions with rationale |
 ---
-## Appendix B: Quick Reference Commands
+## Quick Reference Commands
 ```bash
 # Initialize system
 python3 bin/init.py
@@ -1532,7 +1514,124 @@ def migrate_v1_to_v2():
 
 ---
 
-## Appendix E: Performance Targets & Scaling
+## Appendix E: Dump File Format Specification
+
+### TXT Format (Human-Readable)
+
+Used by `dump.py --project <name>` and `dump.py --all`.
+
+**Structure:**
+```
+# LockedInClaude Memory Dump
+# Project: <project_name> or "ALL"
+# Exported: <ISO8601_timestamp>
+# Total Entries: <count>
+# ============================================
+
+## <entry_title> [optional_project_name]
+**Type:** <type> | **ID:** <uuid>
+**Hash:** sha256:<hash_hex>
+**Keywords:** <comma_separated_keywords>
+**Tags:** <comma_separated_tags>
+**Created:** <ISO8601_timestamp>
+**Updated:** <ISO8601_timestamp>
+
+<entry_content_freeform_text>
+
+---
+
+## <next_entry_title>
+...
+```
+
+**Rules:**
+- Each entry starts with `## <title>`
+- For `--all` dumps, format is `## <title> [project_name]` (project name extracted for devour routing)
+- Metadata lines start with `**` and use colon separator
+- Content section starts after blank line following metadata
+- Entries separated by `---` on its own line
+- TXT is human-readable; use for email/Slack sharing
+
+**Example:**
+```
+# LockedInClaude Memory Dump
+# Project: myapp
+# Exported: 2026-03-25T01:46:00Z
+# Total Entries: 2
+# ============================================
+
+## Auth Handler Pattern
+**Type:** context | **ID:** abc123def456
+**Hash:** sha256:b7f71c05077f38a0f89f033dd6795e9ef04121227048b25a2dc44af39a7c2651
+**Keywords:** auth, journal, pattern
+**Tags:** #architecture
+**Created:** 2026-03-24T20:05:55Z
+**Updated:** 2026-03-24T20:05:55Z
+
+The auth handler uses journaler base class.
+This extends logging capabilities system-wide.
+
+---
+
+## Database Schema
+**Type:** context | **ID:** def456ghi789
+**Hash:** sha256:2240191cb0dee53037c0ad48e69013ff7cc4a7c80df89eecc475e45ad35d9610
+**Keywords:** db, schema, postgres
+**Tags:** 
+**Created:** 2026-03-24T20:06:04Z
+**Updated:** 2026-03-24T20:06:04Z
+
+Using PostgreSQL with JSON columns.
+```
+
+### JSON Format (Machine-Readable)
+
+Optional alternative supported by `dump.py --format json`.
+
+**Structure:**
+```json
+{
+  "project": "myapp",
+  "schema_version": "2.0",
+  "exported_at": "2026-03-25T01:46:00Z",
+  "entries": [
+    {
+      "id": "uuid",
+      "type": "context",
+      "title": "Auth Handler Pattern",
+      "content": "The auth handler...",
+      "keywords": ["auth", "journal", "pattern"],
+      "tags": ["#architecture"],
+      "content_hash": "sha256:...",
+      "created_at": "2026-03-24T20:05:55Z",
+      "updated_at": "2026-03-24T20:05:55Z",
+      "_source_project": "myapp"
+    }
+  ]
+}
+```
+
+### devour.py Format Detection
+
+When importing, devour.py:
+1. Checks first character: `{` or `[` → JSON
+2. Otherwise reads full content and checks for `# LockedInClaude` → TXT
+3. If neither: `STATUS:ERROR code=E003 msg=invalid dump file format`
+
+TXT parsing extracts:
+- Title + optional `[project]` bracket
+- **Type:** field → entry["type"]
+- **ID:** field → entry["id"]
+- **Hash:** field → entry["content_hash"]
+- **Keywords:** comma-separated → entry["keywords"]
+- **Tags:** comma-separated → entry["tags"]
+- **Created:** → entry["created_at"]
+- **Updated:** → entry["updated_at"]
+- Content after `---` separator
+
+---
+
+## Appendix G: Performance Targets & Scaling
 
 ### Latency Targets
 
@@ -1564,7 +1663,7 @@ def migrate_v1_to_v2():
 
 ---
 
-## Appendix A: Changelog
+## Appendix H: Changelog
 
 ### v2.0 Release (Current)
 **New Features:**
