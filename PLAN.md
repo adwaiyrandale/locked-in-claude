@@ -1,7 +1,6 @@
 # LockedInClaude: A Local File-Based Context Memory System for Claude
-## Technical White Paper v2.0 (Enterprise Edition)
 ---
-## 1. Executive Summary
+## 1. Summary
 LockedInClaude is a completely offline, file-based context memory system engineered for Claude Code sessions operating in air-gapped and enterprise environments without internet connectivity. It provides a two-tier persistent memory architecture using only Python standard library primitives and JSON files — zero external dependencies, zero network exposure.
 **Design Philosophy:**
 Memory as a first-class engineering concern — provides queryable, indexed, deduplicated, and corruption-resilient memory that persists across sessions, survives process restarts, and scales to thousands of entries without performance degradation.
