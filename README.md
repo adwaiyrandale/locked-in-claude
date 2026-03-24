@@ -22,6 +22,10 @@ python3 bin/query.py --project myproject --keywords "auth"
 
 # See current session
 python3 bin/query.py --project myproject --session
+
+# Auto-detect type (let Claude decide)
+python3 bin/store.py --project myproject --auto \
+  --title "Journaler pattern" --content "The journaler extends..."
 ```
 
 ## Files

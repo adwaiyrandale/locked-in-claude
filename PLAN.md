@@ -174,7 +174,7 @@ Each index entry now stores a SHA-256 checksum of the memories.json file. The va
 | **Command** | **Purpose** | **Key Flags** |
 |-------------|-------------|---------------|
 | bin/init.py | Initialize or validate system | `--force`, `--validate-only` |
-| bin/store.py | Store longterm or transient memory | `--project`, `--type`, `--title`, `--content`, `--keywords`, `--tags`, `--category`, `--dry-run` |
+| bin/store.py | Store longterm or transient memory | `--project`, `--type`, `--auto`, `--title`, `--content`, `--keywords`, `--tags`, `--category`, `--dry-run` |
 | bin/query.py | Retrieve memories | `--project`, `--keywords`, `--type`, `--recent`, `--since`, `--tag`, `--session`, `--full`, `--format`, `--dry-run` |
 | bin/archive.py | Archive current session | `--project` |
 | bin/list.py | Discover all projects | `--type`, `--format` |
@@ -285,7 +285,50 @@ def store_longterm(project, title, content, keywords, category, tags=[]):
         
         print(f"STATUS:OK id={entry['id']}")
         return entry["id"]
+
+def auto_detect_type(content, title, keywords):
+    """Auto-detect memory type based on content heuristics."""
+    text = (title + " " + content + " " + " ".join(keywords)).lower()
+    
+    # Longterm indicators - architectural, pattern, design decisions
+    longterm_words = [
+        "architecture", "design pattern", "convention", "structure",
+        "extends", "implements", "base class", "inheritance",
+        "api", "interface", "contract", "schema", "data flow",
+        "decision", "rationale", "why we", "because",
+        "pattern", "journaler", "factory", "singleton"
+    ]
+    
+    # Transient indicators - current work, tasks, bugs
+    transient_words = [
+        "fixing", "working on", "task", "todo", "bug", "error",
+        "exception", "crash", "debugging", "refactor",
+        "currently", "in progress", "wip"
+    ]
+    
+    longterm_score = sum(1 for w in longterm_words if w in text)
+    transient_score = sum(1 for w in transient_words if w in text)
+    
+    if longterm_score > transient_score:
+        return "longterm"
+    elif transient_score > longterm_score:
+        return "transient"
+    else:
+        return "longterm"  # Default to longterm
+
+def store(project, title, content, keywords, category, tags=[], auto=False):
+    """Main store entry point with auto-detection."""
+    if auto:
+        memory_type = auto_detect_type(content, title, keywords)
+    else:
+        memory_type = "longterm"  # Default
+    
+    if memory_type == "longterm":
+        return store_longterm(project, title, content, keywords, category, tags)
+    else:
+        return store_transient(project, task=content, status="pending", priority="medium", tags=tags)
 ```
+
 ### 4.4 query.py — Retrieval with Fuzzy Matching
 ```python
 def query(project=None, keywords=[], type="both", recent=0, since=None, tag=None, session=False, full=False):
