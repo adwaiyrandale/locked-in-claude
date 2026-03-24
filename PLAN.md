@@ -1333,6 +1333,237 @@ python3 bin/query.py --project myproject --keywords "test"
 
 ---
 
+## Appendix A: Complete Error Handling Reference
+
+All commands must emit exactly ONE status line as first output token.
+
+| **Error Code** | **Scenario** | **Output** | **Exit Code** |
+|----------------|-------------|-----------|---------------|
+| E001 | Missing required argument (--title, --project, etc.) | `STATUS:ERROR code=E001 msg=<specific message>` | 1 |
+| E002 | Invalid argument value (--type with bad enum) | `STATUS:ERROR code=E002 msg=<specific message>` | 1 |
+| E003 | File format invalid (dump.txt corrupted, bad JSON) | `STATUS:ERROR code=E003 msg=<specific message>` | 1 |
+| E004 | File not found (--file path missing, project missing) | `STATUS:ERROR code=E004 msg=<specific message>` | 1 |
+| E005 | Permission denied (lock file, read-only dir) | `STATUS:ERROR code=E005 msg=<specific message>` | 1 |
+| E006 | Lock timeout (fcntl lock held > 5s) | `STATUS:ERROR code=E006 msg=lock timeout after 5s` | 1 |
+
+| **Status Code** | **Scenario** | **Output Example** |
+|-----------------|-------------|-------------------|
+| OK | Operation succeeded | `STATUS:OK id=uuid...` or `STATUS:OK imported=5 skipped=0` |
+| SKIP | Entry skipped (duplicate, already exists) | `STATUS:SKIP near-duplicate (Jaccard=0.87)` |
+| WARN | Succeeded with warning | `STATUS:WARN truncated to 1MB` |
+| DRY | Dry-run preview (no changes made) | `STATUS:DRY imported=5 updated=0 skipped=2` |
+
+**Rule:** First line of stdout MUST be `STATUS:...`. No exceptions.
+
+---
+
+## Appendix B: Edge Case Handling
+
+### Corrupted/Partial Files
+
+**Scenario:** memories.json is partially written (power loss)
+- **Behavior:** read_json() will raise JSONDecodeError
+- **Fix:** init.py validate() checks file with sha256_file()
+- **Recovery:** Re-run `python3 bin/init.py` (will detect mismatch, reindex)
+
+**Scenario:** Lock file exists but process crashed
+- **Behavior:** fcntl.flock() will acquire lock (lock file is stale)
+- **Fix:** fcntl handles this automatically; no special code needed
+- **Recovery:** Next command acquires lock, proceeds normally
+
+**Scenario:** .tmp file exists but rename failed (OS crash)
+- **Behavior:** write_json() uses atomic rename; file is either old or new, never corrupt
+- **Fix:** No fix needed (design prevents this)
+- **Recovery:** Re-run command; .tmp is overwritten
+
+### Concurrent Access
+
+**Scenario:** Two Claude sessions store to same project simultaneously
+- **Behavior:** First gets LOCK_EX, second waits up to 5s, then fails with E006
+- **Fix:** Caller should retry with backoff: wait 0.1s, retry up to 50 times
+- **Recovery:** Second session waits, acquires lock after first releases
+
+**Scenario:** One session reads while another writes
+- **Behavior:** Reader sees stale index (reads use current index at query time)
+- **Fix:** index.json is only updated at write time; reads ignore it for consistency
+- **Recovery:** No issue; each session is isolated
+
+**Scenario:** Index becomes corrupted (entry_count wrong, missing keywords)
+- **Behavior:** maintain.py --validate detects via checksum mismatch
+- **Fix:** validate() triggers reindex_project()
+- **Recovery:** Run `python3 bin/maintain.py --validate`
+
+---
+
+## Appendix C: Test Scenarios with Expected Output
+
+### Test 1: Basic Store & Query
+
+```bash
+# Init
+python3 bin/init.py
+# Expected: STATUS:OK init complete
+
+# Store
+python3 bin/store.py --project test --auto \
+  --title "Test Entry" --content "Hello world" --keywords "test"
+# Expected: STATUS:OK id=<uuid>
+
+# Query
+python3 bin/query.py --project test --keywords "test" --summary
+# Expected: STATUS:OK longterm=1 transient=0 [entry listed]
+```
+
+### Test 2: Fuzzy Deduplication
+
+```bash
+# Store with keywords: ["auth", "handler", "pattern"]
+python3 bin/store.py --project test --auto \
+  --title "Auth Handler" --content "..." --keywords "auth,handler,pattern"
+# Expected: STATUS:OK id=<uuid>
+
+# Store with >85% Jaccard similarity (same keywords)
+python3 bin/store.py --project test --auto \
+  --title "Another Auth" --content "Different content" --keywords "auth,handler,pattern"
+# Expected: STATUS:SKIP near-duplicate (Jaccard=1.00)
+
+# Store with --no-fuzzy-dedup flag
+python3 bin/store.py --project test --auto \
+  --title "Another Auth" --content "Different" --keywords "auth,handler,pattern" \
+  --no-fuzzy-dedup
+# Expected: STATUS:OK id=<uuid> (no dedup check)
+```
+
+### Test 3: Dump & Devour
+
+```bash
+# Export
+python3 bin/dump.py --project test --output /tmp/test_dump.txt
+# Expected: STATUS:OK dumped=2 file=/tmp/test_dump.txt
+
+# Dry-run import to new project
+python3 bin/devour.py --file /tmp/test_dump.txt --project test2 --dry-run
+# Expected: STATUS:DRY imported=2 updated=0 skipped=0
+
+# Actual import
+python3 bin/devour.py --file /tmp/test_dump.txt --project test2
+# Expected: STATUS:OK imported=2 updated=0 skipped=0
+
+# Verify
+python3 bin/query.py --project test2 --keywords "test" --summary
+# Expected: 2 entries found
+```
+
+### Test 4: Validation & Self-Healing
+
+```bash
+# Corrupt memories.json
+echo "broken json" > ~/.locked-in-claude/longterm/projects/test/memories.json
+
+# Validate and heal
+python3 bin/maintain.py --validate
+# Expected: STATUS:OK validate complete healed=1
+
+# File should be restored or rebuilt
+python3 bin/query.py --project test --summary
+# Expected: STATUS:OK (or no entries if file was empty)
+```
+
+### Test 5: Concurrent Access Simulation
+
+```bash
+# Terminal 1: Start a long store operation
+python3 bin/store.py --project concurrent --auto \
+  --title "Long Op" --content "Waiting..." --keywords "test"
+
+# Terminal 2 (while T1 is locked): Try store to same project
+python3 bin/store.py --project concurrent --auto \
+  --title "Conflict" --content "..." --keywords "test"
+
+# Expected Terminal 2: 
+#   - Waits up to 5 seconds
+#   - If T1 finishes: STATUS:OK
+#   - If T1 times out: STATUS:ERROR code=E006 msg=lock timeout
+```
+
+---
+
+## Appendix D: Schema Migration (v1.0 → v2.0)
+
+### What Changed
+
+| **Aspect** | **v1.0** | **v2.0** | **Migration** |
+|-----------|----------|----------|---------------|
+| Index checksums | None | SHA-256 per project file | Add "checksum" field to each entry in index.json entries |
+| Transient index | Global inverted index | None (direct file reads) | Delete transient/index.json |
+| Entry schema | Basic | Added keyword_fingerprint (optional) | Keep existing; new entries add field |
+| Status codes | Limited | Full contract (OK/SKIP/WARN/ERROR/DRY) | Update all print statements |
+
+### Migration Function Pseudocode
+
+```python
+def migrate_v1_to_v2():
+    """Upgrade from v1.0 to v2.0."""
+    index_path = os.path.join(BASE_DIR, "longterm/index.json")
+    index = read_json(index_path)
+    
+    if index.get("schema_version") == "2.0":
+        return  # Already migrated
+    
+    # Step 1: Add checksums to index entries
+    for entry in index.get("entries", []):
+        proj = entry["project"]
+        mem_file = os.path.join(BASE_DIR, "longterm", entry["file"])
+        entry["checksum"] = sha256_file(mem_file) if os.path.exists(mem_file) else ""
+    
+    # Step 2: Remove transient/index.json if exists
+    transient_index = os.path.join(BASE_DIR, "transient/index.json")
+    if os.path.exists(transient_index):
+        os.remove(transient_index)
+    
+    # Step 3: Update schema_version
+    index["schema_version"] = "2.0"
+    
+    # Step 4: Write updated index
+    write_json(index_path, index)
+    
+    print("STATUS:OK migration complete v1.0→v2.0")
+```
+
+---
+
+## Appendix E: Performance Targets & Scaling
+
+### Latency Targets
+
+| **Operation** | **Dataset** | **Target Latency** | **Acceptance** |
+|---------------|-------------|-------------------|----------------|
+| store.py (longterm) | Any size | < 500ms | Include lock acquisition + dedup checks |
+| store.py (transient) | Any size | < 100ms | No index update needed |
+| query.py (keyword) | 1000 entries | < 100ms | Inverted index O(1) lookup |
+| query.py (--summary) | 10000 entries | < 50ms | No content load |
+| dump.py (single project) | 1000 entries | < 1s | File read + format |
+| devour.py (import) | 1000 entries | < 5s | Hash checks + dedup |
+| maintain.py --validate | 100 projects | < 10s | Checksum verification |
+
+### Scaling Limits
+
+- **Max entry size:** 1MB (truncated with `STATUS:WARN`)
+- **Max keywords per entry:** 20 (truncated)
+- **Max projects:** No hard limit (tested to 100+)
+- **Max entries per project:** No hard limit (tested to 10,000+)
+- **Max index size:** ~1MB per 5000 entries
+- **Concurrent sessions:** Tested to 10+ (fcntl handles queuing)
+
+### Optimization Notes
+
+- Use `--summary` flag for queries on large datasets (no content load)
+- Use `--dry-run` with devour before importing large dumps
+- Run `maintain.py --vacuum --older-than 30d` monthly to clean old sessions
+- Index is loaded once per command; no memory accumulation across sessions
+
+---
+
 ## Appendix A: Changelog
 
 ### v2.0 Release (Current)
