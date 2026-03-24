@@ -180,6 +180,8 @@ Each index entry now stores a SHA-256 checksum of the memories.json file. The va
 | bin/list.py | Discover all projects | `--type`, `--format` |
 | bin/maintain.py | Index rebuild, validate, vacuum | `--rebuild`, `--validate`, `--vacuum`, `--older-than` |
 | bin/migrate.py | Run schema migrations | `--from-version`, `--to-version`, `--dry-run` |
+| bin/dump.py | Export memories to shareable file | `--project`, `--output`, `--format` |
+| bin/devour.py | Import/ingest shared memories | `--file`, `--project`, `--merge` |
 ### 4.2 init.py — Initialization & Startup Validation
 On every invocation, init.py runs a lightweight validate() pass before returning. This is the self-healing entry point.
 ```python
@@ -470,7 +472,109 @@ def run_migration(from_ver, to_ver, dry_run=False):
     fn()
     print(f"STATUS:OK migrated from {from_ver} to {to_ver}")
 ```
+
+**bin/dump.py — Memory Export (Blue Lock: "The Dump"):**
+Export memories to a shareable text file. Used when User A wants to share memories with User B.
+
+```python
+def dump_memory(project, output_path=None, format="txt"):
+    """Export project memories to a shareable file."""
+    memories = read_all_memories(project)
+    
+    if not output_path:
+        output_path = os.path.join(os.getcwd(), f"{project}_memoryDump.txt")
+    
+    if format == "txt":
+        with open(output_path, "w") as f:
+            f.write(f"# LockedInClaude Memory Dump\n")
+            f.write(f"# Project: {project}\n")
+            f.write(f"# Exported: {now()}\n")
+            f.write(f"# ============================================\n\n")
+            
+            for entry in memories:
+                f.write(f"## {entry['title']}\n")
+                f.write(f"**Type:** {entry['type']} | **ID:** {entry['id']}\n")
+                f.write(f"**Keywords:** {', '.join(entry.get('keywords', []))}\n")
+                f.write(f"**Tags:** {', '.join(entry.get('tags', []))}\n")
+                f.write(f"**Created:** {entry.get('created_at')}\n\n")
+                f.write(f"{entry['content']}\n\n")
+                f.write(f"---\n\n")
+        
+        print(f"STATUS:OK dumped={len(memories)} file={output_path}")
+    else:
+        # JSON format
+        write_json(output_path, {
+            "project": project,
+            "exported_at": now(),
+            "entries": memories
+        })
+        print(f"STATUS:OK dumped={len(memories)} file={output_path}")
+    
+    return output_path
+```
+
+**bin/devour.py — Memory Import (Blue Lock: "The Devour"):**
+Import/ingest shared memories from a dump file. Prevents duplicates, updates existing entries if newer.
+
+```python
+def devour_memory(file_path, project=None, merge=False):
+    """Import/ingest memories from a dump file."""
+    data = read_json(file_path)  # or parse from txt
+    
+    imported_project = data.get("project")
+    entries = data.get("entries", [])
+    
+    target_project = project or imported_project
+    
+    imported_count = 0
+    skipped_count = 0
+    updated_count = 0
+    
+    for entry in entries:
+        # Check for duplicates by content hash
+        content_hash = entry.get("content_hash", "").replace("sha256:", "")
+        
+        existing = find_by_hash(target_project, content_hash)
+        if existing:
+            # Check if imported is newer
+            if parse_iso(entry.get("updated_at")) > parse_iso(existing.get("updated_at", "")):
+                update_entry(target_project, existing["id"], entry)
+                updated_count += 1
+            else:
+                skipped_count += 1
+            continue
+        
+        # Check fuzzy duplicate
+        new_kws = set(entry.get("keywords", []))
+        fuzzy_match = find_fuzzy_duplicate(target_project, new_kws)
+        if fuzzy_match:
+            skipped_count += 1
+            continue
+        
+        # Import new entry
+        add_entry(target_project, entry)
+        imported_count += 1
+    
+    # Rebuild index
+    rebuild_index()
+    
+    print(f"STATUS:OK imported={imported_count} updated={updated_count} skipped={skipped_count}")
+    
+    return {"imported": imported_count, "updated": updated_count, "skipped": skipped_count}
+```
+
+**Sharing Workflow:**
+1. User A: `python bin/dump.py --project zap --output ~/Downloads/zap_memoryDump.txt`
+2. User A shares file via email/Confluence/Slack
+3. User B: `python bin/devour.py --file ~/Downloads/zap_memoryDump.txt --project zap`
+
+**Conflict Resolution:**
+- Same content hash → skip (or update if newer)
+- Similar keywords (>85% Jaccard) → skip
+- New content → import as new entry
+
 ---
+
 ## 5. Keyword Processing Pipeline
 Keyword quality is the single biggest determinant of retrieval accuracy. v2.0 introduces a multi-stage normalization pipeline.
 | **Stage** | **Operation** | **Example** |
@@ -627,6 +731,46 @@ def get_file_lock(lock_path):
 ```
 **Windows Compatibility Note:**
 fcntl is POSIX-only. On Windows, LockedInClaude falls back to a lock-file spin-wait approach. The spin-wait has a 5-second timeout before raising a LockTimeoutError.
+
+### 6.2 Multi-Session Concurrent Access
+Multiple Claude sessions can access the same memory system simultaneously. Each session:
+- Can read memories without blocking
+- Gets exclusive lock only when writing
+- Uses non-blocking lock with timeout (5 seconds)
+- Retries once on lock conflict
+
+```python
+def concurrent_read(project, keywords):
+    """Read without blocking - no lock needed."""
+    # Direct read from index and memories.json
+    index = read_json(index_path)
+    results = fuzzy_keyword_search(index, project, keywords)
+    return load_and_filter(results)
+
+def concurrent_write(project, entry):
+    """Write with exclusive lock."""
+    lock_file = f"{BASE_DIR}/locks/{project}.lock"
+    with get_lock(lock_file):
+        # Read-modify-write
+        data = load_memories(project)
+        data["entries"].append(entry)
+        write_json(mem_file, data)
+        update_index(project, entry)
+```
+
+**Session Coordination:**
+- Each project has its own lock file
+- Lock timeout is 5 seconds (configurable)
+- If lock fails, retry once after 100ms
+- All concurrent writes are serialized per project
+- Reads can happen in parallel across projects
+
+**Best Practices:**
+- Use `--summary` for quick orientation queries (less data transfer)
+- Batch multiple writes when possible
+- Use `--no-fuzzy-dedup` for high-frequency writes
+- Monitor lock timeout errors (indicates contention)
+
 ---
 ## 7. Machine-Readable Output Contract
 Every CLI command in v2.0 emits a structured STATUS line as its first or only line of output.
