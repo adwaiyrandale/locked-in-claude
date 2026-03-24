@@ -18,6 +18,8 @@ This stores project context that persists across Claude sessions. No internet ne
 
 **Session tracking** - Keep track of what you're working on in the current session.
 
+**Sharing** - Export memories to share with team members via email/Confluence/Slack.
+
 ## Features
 
 - Two-tier memory (longterm + transient)
@@ -28,6 +30,8 @@ This stores project context that persists across Claude sessions. No internet ne
 - Self-healing index on startup
 - Atomic writes (no corrupted files)
 - Tags support (#architecture, #decision, #bug)
+- Export/import memories (dump/devour)
+- Full backup with --all flag
 
 ## Quick
 
@@ -52,6 +56,13 @@ python3 bin/query.py --project myproject --session
 # List all projects
 python3 bin/list.py
 
+# Export memories (share with team)
+python3 bin/dump.py --project myproject
+python3 bin/dump.py --all           # Full backup
+
+# Import memories
+python3 bin/devour.py --file shared_dump.txt --project myproject
+
 # Validate index
 python3 bin/maintain.py --validate
 ```
@@ -65,10 +76,22 @@ python3 bin/maintain.py --validate
 - `bin/archive.py` - Archive sessions
 - `bin/maintain.py` - Rebuild/validate/vacuum
 - `bin/migrate.py` - Schema changes
+- `bin/dump.py` - Export memories (--all for full backup)
+- `bin/devour.py` - Import memories
+
+## Sharing Workflow
+
+1. **Export**: `python bin/dump.py --project zap --output ~/shared/zap_dump.txt`
+2. **Share**: Send file via email/Confluence/Slack
+3. **Import**: `python bin/devour.py --file ~/Downloads/zap_dump.txt --project zap`
+
+Or full backup:
+1. **Export all**: `python bin/dump.py --all`
+2. **Import all**: `python bin/devour.py --file ALL_memoryDump.txt`
 
 ## More
 
-See [PLAN.md](./PLAN.md) for full details.
+See [PLAN.md](./PLAN.md) for full details including implementation guide.
 
 ## Reqs
 
