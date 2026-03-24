@@ -180,7 +180,7 @@ Each index entry now stores a SHA-256 checksum of the memories.json file. The va
 | bin/list.py | Discover all projects | `--type`, `--format` |
 | bin/maintain.py | Index rebuild, validate, vacuum | `--rebuild`, `--validate`, `--vacuum`, `--older-than` |
 | bin/migrate.py | Run schema migrations | `--from-version`, `--to-version`, `--dry-run` |
-| bin/dump.py | Export memories to shareable file | `--project`, `--output`, `--format` |
+| bin/dump.py | Export memories to shareable file | `--project`, `--all`, `--output`, `--format` |
 | bin/devour.py | Import/ingest shared memories | `--file`, `--project`, `--merge` |
 ### 4.2 init.py — Initialization & Startup Validation
 On every invocation, init.py runs a lightweight validate() pass before returning. This is the self-healing entry point.
@@ -477,38 +477,50 @@ def run_migration(from_ver, to_ver, dry_run=False):
 Export memories to a shareable text file. Used when User A wants to share memories with User B.
 
 ```python
-def dump_memory(project, output_path=None, format="txt"):
-    """Export project memories to a shareable file."""
-    memories = read_all_memories(project)
+def dump_memory(project=None, output_path=None, format="txt", all_projects=False):
+    """Export project memories to a shareable file.
     
-    if not output_path:
-        output_path = os.path.join(os.getcwd(), f"{project}_memoryDump.txt")
-    
-    if format == "txt":
-        with open(output_path, "w") as f:
-            f.write(f"# LockedInClaude Memory Dump\n")
-            f.write(f"# Project: {project}\n")
-            f.write(f"# Exported: {now()}\n")
-            f.write(f"# ============================================\n\n")
-            
-            for entry in memories:
-                f.write(f"## {entry['title']}\n")
-                f.write(f"**Type:** {entry['type']} | **ID:** {entry['id']}\n")
-                f.write(f"**Keywords:** {', '.join(entry.get('keywords', []))}\n")
-                f.write(f"**Tags:** {', '.join(entry.get('tags', []))}\n")
-                f.write(f"**Created:** {entry.get('created_at')}\n\n")
-                f.write(f"{entry['content']}\n\n")
-                f.write(f"---\n\n")
+    Args:
+        project: Single project name. If None and --all not set, error.
+        all_projects: If True, dump ALL projects into one file.
+    """
+    if all_projects:
+        # Dump all projects
+        all_memories = []
+        index = read_json(os.path.join(BASE_DIR, "longterm/index.json"))
+        for entry in index.get("entries", []):
+            proj = entry["project"]
+            proj_memories = read_all_memories(proj)
+            for m in proj_memories:
+                m["_source_project"] = proj  # Tag with source
+            all_memories.extend(proj_memories)
         
-        print(f"STATUS:OK dumped={len(memories)} file={output_path}")
+        dump_to_file(all_memories, "ALL", output_path, format)
     else:
-        # JSON format
-        write_json(output_path, {
-            "project": project,
-            "exported_at": now(),
-            "entries": memories
-        })
-        print(f"STATUS:OK dumped={len(memories)} file={output_path}")
+        # Dump single project
+        memories = read_all_memories(project)
+        dump_to_file(memories, project, output_path, format)
+```
+
+```bash
+# Dump single project
+python bin/dump.py --project zap
+
+# Dump ALL projects (full backup)
+python bin/dump.py --all
+
+# Dump to specific location
+python bin/dump.py --project zap --output ~/shared/zap_dump.txt
+
+# Dump as JSON
+python bin/dump.py --project zap --format json
+```
+
+**Full Memory Dump (--all):**
+Dumps ALL project memories into a single file. Useful for:
+- Complete backup
+- Sharing entire memory across machines
+- Migrating to new environment
     
     return output_path
 ```
@@ -1090,7 +1102,155 @@ python3 bin/maintain.py --vacuum --older-than 30
 # Migrate from v1.0 to v2.0
 python3 bin/migrate.py --from-version 1.0 --to-version 2.0
 ```
+
 ---
-*Document Version: 2.0*
-*LockedInClaude Enterprise Edition*
-*Zero Dependencies · Fully Offline · Production-Grade*
+
+## Implementation Guide
+
+This section provides step-by-step instructions for implementing LockedInClaude from scratch. Any Claude instance can follow these phases to build the system.
+
+### Phase 1: Foundation
+
+1. **Create directory structure:**
+```bash
+mkdir -p bin tests
+```
+
+2. **Create utils.py** - Shared functions (keyword normalization, stemming, file I/O, etc.)
+   - Define BASE_DIR = "~/.locked-in-claude"
+   - Implement write_json() / read_json() with atomic writes
+   - Implement normalize_keywords() with STEM_MAP and stop-word filter
+   - Implement extract_keywords() with frequency analysis
+   - Implement jaccard_similarity() for deduplication
+
+3. **Create init.py:**
+```bash
+#!/usr/bin/env python3
+"""Initialize LockedInClaude system."""
+import os, sys, argparse
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from utils import BASE_DIR, CURRENT_VERSION, write_json, read_json
+
+def init(force=False, validate_only=False):
+    # Create directories
+    # Create index files
+    # Run validate_and_heal()
+```
+
+### Phase 2: Core Storage
+
+4. **Create store.py:**
+   - Implement get_lock() / release_lock() with fcntl
+   - Implement load_or_create_memories()
+   - Implement store_longterm() with SHA-256 exact dedup + Jaccard fuzzy dedup
+   - Implement store_transient()
+   - Implement update_index()
+   - Implement auto_detect_type() for --auto flag
+
+5. **Test store.py:**
+```bash
+python3 bin/init.py
+python3 bin/store.py --project test --type longterm --title "Test" --content "Hello world" --keywords "test"
+```
+
+### Phase 3: Query System
+
+6. **Create query.py:**
+   - Implement fuzzy_keyword_search() with stemming
+   - Implement load_and_filter() with tag/since/full/summary filters
+   - Implement get_active_session()
+   - Add --since parsing (e.g., 2h, 7d)
+
+7. **Test query.py:**
+```bash
+python3 bin/query.py --project test --keywords "test"
+python3 bin/query.py --project test --summary
+```
+
+### Phase 4: Tooling
+
+8. **Create list.py:**
+   - List all projects from index
+   - Support --type and --format flags
+
+9. **Create archive.py:**
+   - Archive active session
+   - Create new session
+
+10. **Create maintain.py:**
+    - Implement rebuild_index()
+    - Implement validate_index() with self-healing
+    - Implement vacuum_sessions()
+
+11. **Create migrate.py:**
+    - Schema migration support
+    - v1.0 to v2.0 migration
+
+### Phase 5: Sharing
+
+12. **Create dump.py:**
+    - Export single project with --project
+    - Export ALL projects with --all
+    - Support txt and json formats
+
+13. **Create devour.py:**
+    - Import memories from dump file
+    - Handle duplicate detection (exact hash + fuzzy)
+    - Update existing entries if newer
+
+14. **Test sharing:**
+```bash
+# Export
+python3 bin/dump.py --project test
+python3 bin/dump.py --all
+
+# Import to new project
+python3 bin/devour.py --file dump.txt --project test2
+```
+
+### Phase 6: Integration
+
+15. **Add to CLAUDE.md:**
+```
+## Context Memory
+Use ~/.locked-in-claude/ for storing project context.
+
+# Store
+python3 bin/store.py --project <name> --auto --title "..." --content "..."
+
+# Query
+python3 bin/query.py --project <name> --keywords "..."
+
+# Session
+python3 bin/query.py --project <name> --session
+
+# Share
+python3 bin/dump.py --project <name> --output file.txt
+python3 bin/devour.py --file file.txt --project <name>
+```
+
+### Quick Start Commands
+
+```bash
+# Phase 1
+echo '#!/usr/bin/env python3
+import os, json, hashlib, uuid
+BASE_DIR = os.path.expanduser("~/.locked-in-claude")
+# ... copy from PLAN.md utils section' > bin/utils.py
+
+# Phase 1-2
+cp bin/utils.py bin/init.py && # add init code
+cp bin/utils.py bin/store.py && # add store code
+
+# Run
+python3 bin/init.py
+python3 bin/store.py --project myproject --auto --title "First memory" --content "Important info" --keywords "test"
+
+# Query
+python3 bin/query.py --project myproject --keywords "test"
+```
+
+---
+
+*Document Version: 2.1*
+*LockedInClaude*

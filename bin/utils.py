@@ -187,3 +187,29 @@ def get_preview(content, max_chars=200):
     if last_space > max_chars * 0.7:
         preview = preview[:last_space]
     return preview + "..."
+
+
+def get_lock(lock_path, timeout=5.0):
+    """Get file lock."""
+    import fcntl
+    import time
+    
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    fd = open(lock_path, "w")
+    start = time.time()
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except BlockingIOError:
+            if time.time() - start >= timeout:
+                fd.close()
+                raise TimeoutError(f"Lock timeout after {timeout}s")
+            time.sleep(0.1)
+
+
+def release_lock(fd):
+    """Release file lock."""
+    import fcntl
+    fcntl.flock(fd, fcntl.LOCK_UN)
+    fd.close()
