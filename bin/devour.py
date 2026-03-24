@@ -55,7 +55,6 @@ def update_entry(project, entry_id, new_data):
         
         for entry in data.get("entries", []):
             if entry["id"] == entry_id:
-                # Update fields
                 entry["title"] = new_data.get("title", entry.get("title"))
                 entry["content"] = new_data.get("content", entry.get("content"))
                 entry["keywords"] = new_data.get("keywords", entry.get("keywords"))
@@ -91,7 +90,6 @@ def add_entry(project, entry):
                 "entries": []
             }
         
-        # Add new ID if not present
         if "id" not in entry:
             import uuid
             entry["id"] = str(uuid.uuid4())
@@ -100,22 +98,83 @@ def add_entry(project, entry):
         data["last_updated"] = now()
         
         write_json(mem_file, data)
+        return entry["id"]
     
     finally:
         release_lock(lock_fd)
 
 
-def devour_memory(file_path, project=None, merge=False):
-    """Import/ingest memories from a dump file."""
-    # Check if file is JSON or TXT
-    data = None
-    is_json = False
+def update_index_incremental(project, keywords):
+    """Update index for a single project (incremental)."""
+    index_path = os.path.join(BASE_DIR, "longterm", "index.json")
+    index = read_json(index_path)
     
+    if not index:
+        return
+    
+    # Update project entry
+    proj_entry = None
+    for e in index.get("entries", []):
+        if e["project"] == project:
+            proj_entry = e
+            break
+    
+    if not proj_entry:
+        proj_entry = {
+            "project": project,
+            "file": f"projects/{project}/memories.json",
+            "keywords": [],
+            "entry_count": 0,
+            "checksum": "",
+            "total_size_bytes": 0,
+            "last_updated": now()
+        }
+        index["entries"].append(proj_entry)
+    
+    proj_entry["entry_count"] = proj_entry.get("entry_count", 0) + 1
+    proj_entry["last_updated"] = now()
+    
+    # Update keyword index
+    for kw in keywords:
+        kw_lower = kw.lower()
+        if kw_lower not in index.get("keyword_index", {}):
+            index["keyword_index"][kw_lower] = []
+        
+        refs = index["keyword_index"][kw_lower]
+        if not any(r.get("project") == project for r in refs):
+            refs.append({
+                "project": project,
+                "file": f"projects/{project}/memories.json"
+            })
+    
+    index["last_full_reindex"] = now()
+    write_json(index_path, index)
+
+
+def validate_dump_file(data):
+    """Validate dump file has required structure."""
+    if not isinstance(data, dict):
+        return False, "not a dictionary"
+    
+    if "entries" not in data:
+        return False, "missing 'entries' key"
+    
+    if not isinstance(data.get("entries"), list):
+        return False, "'entries' is not a list"
+    
+    return True, None
+
+
+def devour_memory(file_path, project=None, merge=False, merge_strategy="newest", dry_run=False):
+    """Import/ingest memories from a dump file."""
+    # Read and detect format
     with open(file_path, "r") as f:
         first_char = f.read(1)
     
+    data = None
+    is_json = False
+    
     if first_char == "{" or first_char == "[":
-        # Try JSON
         try:
             data = read_json(file_path)
             is_json = True
@@ -128,7 +187,6 @@ def devour_memory(file_path, project=None, merge=False):
             content = f.read()
         
         if content.startswith("# LockedInClaude"):
-            # Parse txt format
             entries = []
             current_entry = None
             current_content = []
@@ -139,13 +197,26 @@ def devour_memory(file_path, project=None, merge=False):
                     if current_entry:
                         current_entry["content"] = "\n".join(current_content).strip()
                         entries.append(current_entry)
+                    
+                    # Extract title and optional [project] bracket from --all dumps
+                    title_part = line[3:].strip()
+                    source_project = None
+                    if title_part.endswith("]"):
+                        bracket_start = title_part.rfind("[")
+                        if bracket_start > 0:
+                            source_project = title_part[bracket_start+1:-1]
+                            title_part = title_part[:bracket_start].strip()
+                    
                     current_entry = {
-                        "title": line[3:].strip(),
+                        "title": title_part,
                         "type": "unknown",
                         "keywords": [],
                         "tags": [],
                         "content": ""
                     }
+                    if source_project:
+                        current_entry["_source_project"] = source_project
+                    
                     current_content = []
                     in_content = False
                 elif current_entry:
@@ -181,16 +252,24 @@ def devour_memory(file_path, project=None, merge=False):
                 "project": None,
                 "entries": entries
             }
-        else:
-            print("STATUS:ERROR code=E003 msg=invalid dump file format")
-            return None
+    
+    if not data:
+        print("STATUS:ERROR code=E003 msg=invalid dump file format")
+        return None
+    
+    # Validate structure
+    valid, error = validate_dump_file(data)
+    if not valid:
+        print(f"STATUS:ERROR code=E003 msg=invalid dump: {error}")
+        return None
+    
+    entries = data.get("entries", [])
+    is_all_dump = "_source_project" in entries[0] if entries else False
     
     imported_project = data.get("project")
-    entries = data.get("entries", [])
-    
     target_project = project or imported_project
     
-    if not target_project:
+    if not target_project and not is_all_dump:
         print("STATUS:ERROR code=E001 msg=no project specified")
         return None
     
@@ -198,21 +277,42 @@ def devour_memory(file_path, project=None, merge=False):
     skipped_count = 0
     updated_count = 0
     
+    # Process entries
     for entry in entries:
+        # Determine target project for this entry
+        if is_all_dump:
+            entry_project = entry.get("_source_project")
+            if not entry_project:
+                continue
+        else:
+            entry_project = target_project
+        
+        if not entry_project:
+            continue
+        
         # Check for duplicates by content hash
         content_hash = entry.get("content_hash", "")
         if not content_hash:
             content_hash = "sha256:" + hashlib.sha256(entry.get("content", "").encode()).hexdigest()
         
-        existing = find_by_hash(target_project, content_hash.replace("sha256:", ""))
+        existing = find_by_hash(entry_project, content_hash.replace("sha256:", ""))
         
         if existing:
-            # Check if imported is newer
+            if merge_strategy == "skip":
+                skipped_count += 1
+                continue
+            
+            if merge_strategy == "overwrite":
+                update_entry(entry_project, existing["id"], entry)
+                updated_count += 1
+                continue
+            
+            # newest (default)
             imported_updated = parse_iso(entry.get("updated_at") or entry.get("created_at"))
             existing_updated = parse_iso(existing.get("updated_at") or existing.get("created_at"))
             
             if imported_updated > existing_updated:
-                update_entry(target_project, existing["id"], entry)
+                update_entry(entry_project, existing["id"], entry)
                 updated_count += 1
             else:
                 skipped_count += 1
@@ -220,23 +320,28 @@ def devour_memory(file_path, project=None, merge=False):
         
         # Check fuzzy duplicate
         keywords = normalize_keywords(entry.get("keywords", []))
-        fuzzy_match = find_fuzzy_duplicate(target_project, keywords)
+        fuzzy_match = find_fuzzy_duplicate(entry_project, keywords)
         if fuzzy_match:
-            skipped_count += 1
-            continue
+            if merge_strategy != "overwrite":
+                skipped_count += 1
+                continue
         
         # Import new entry
-        add_entry(target_project, entry)
-        imported_count += 1
+        if dry_run:
+            imported_count += 1
+        else:
+            new_id = add_entry(entry_project, entry)
+            if new_id:
+                imported_count += 1
+                # Incremental index update
+                update_index_incremental(entry_project, keywords)
     
-    # Rebuild index
-    from maintain import rebuild_index
-    rebuild_index()
+    if not dry_run:
+        print(f"STATUS:OK imported={imported_count} updated={updated_count} skipped={skipped_count}")
+    else:
+        print(f"STATUS:DRY imported={imported_count} updated={updated_count} skipped={skipped_count}")
     
-    result = {"imported": imported_count, "updated": updated_count, "skipped": skipped_count}
-    print(f"STATUS:OK imported={imported_count} updated={updated_count} skipped={skipped_count}")
-    
-    return result
+    return {"imported": imported_count, "updated": updated_count, "skipped": skipped_count}
 
 
 def main():
@@ -244,9 +349,12 @@ def main():
     parser.add_argument("--file", required=True, help="Dump file to import")
     parser.add_argument("--project", help="Target project name (overrides dump project)")
     parser.add_argument("--merge", action="store_true", help="Merge into existing project")
+    parser.add_argument("--merge-strategy", choices=["skip", "overwrite", "newest"], default="newest",
+                        help="How to handle conflicts: skip (keep existing), overwrite (replace), newest (update if imported is newer)")
+    parser.add_argument("--dry-run", action="store_true", help="Preview only, don't actually import")
     args = parser.parse_args()
     
-    devour_memory(args.file, args.project, args.merge)
+    devour_memory(args.file, args.project, args.merge, args.merge_strategy, args.dry_run)
 
 
 if __name__ == "__main__":

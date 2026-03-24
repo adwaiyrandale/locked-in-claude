@@ -1,100 +1,151 @@
 # LockedInClaude
 
-A local file-based context memory system for Claude. Works completely offline with zero dependencies.
+A completely offline, file-based context memory system for Claude. **Zero dependencies**, **zero internet**, **pure Python stdlib**.
 
-## Why
+## Why?
 
-You work on a project for weeks, figure out how things work, then next month you forget. Or you have multiple projects and Claude keeps asking "what's the journaler again?"
+You work on projects for weeks, figure out architecture and patterns, then context evaporates. Claude asks "what's the journaler pattern again?" and you're starting over.
 
-This stores project context that persists across Claude sessions. No internet needed. No external packages. Just JSON files in `~/.locked-in-claude/`.
-
-## Use Cases
-
-**Air-gapped environments** - No internet? No problem. Everything stays local.
-
-**Enterprise/closed networks** - Works in secure environments where external packages aren't allowed.
-
-**Multi-project memory** - Store patterns, architecture decisions, component relationships and find them later.
-
-**Session tracking** - Keep track of what you're working on in the current session.
-
-**Sharing** - Export memories to share with team members via email/Confluence/Slack.
+**LockedInClaude** stores persistent, queryable memories that:
+- Survive session restarts and process crashes
+- Work in air-gapped, offline environments  
+- Scale to thousands of entries without external packages
+- Support team collaboration through memory sharing
+- Deduplicate intelligently (exact hash + fuzzy keyword matching)
+- Self-heal corrupted indexes on startup
 
 ## Features
 
-- Two-tier memory (longterm + transient)
-- Auto-detect memory type based on content
-- Keyword search with stemming
-- Fuzzy deduplication (Jaccard similarity)
-- File locking for concurrent sessions
-- Self-healing index on startup
-- Atomic writes (no corrupted files)
-- Tags support (#architecture, #decision, #bug)
-- Export/import memories (dump/devour)
-- Full backup with --all flag
+| Feature | How It Works |
+|---------|-------------|
+| **Two-tier memory** | Longterm (persistent) + Transient (session-scoped) |
+| **Auto-detection** | Reads content, determines if longterm or transient |
+| **Keyword search** | Stemmed, stop-word filtered, fuzzy matching |
+| **Deduplication** | SHA-256 exact match + Jaccard fuzzy keyword match |
+| **Concurrency-safe** | POSIX `fcntl.flock()` prevents corruption across parallel sessions |
+| **Self-healing** | Validates index & checksums on startup, auto-repairs |
+| **Atomic writes** | Temp file → rename pattern prevents partial writes |
+| **Tagging** | #architecture, #decision, #bug, #pattern, #api, etc. |
+| **Sharing** | Export single projects or full backup via dump/devour |
+| **Merge strategies** | skip, overwrite, or newest (default) for team imports |
 
-## Quick
+## Quick Start
 
 ```bash
-# Setup
+# Init (creates ~/.locked-in-claude/ structure)
 python3 bin/init.py
 
-# Store something (auto-detects longterm vs transient)
-python3 bin/store.py --project myproject --auto \
-  --title "How auth works" --content "The auth handler..." \
-  --keywords "auth,handler,middleware"
+# Store context (auto-detects memory type)
+python3 bin/store.py --project myapp --auto \
+  --title "Auth pattern in login handler" \
+  --content "Uses journaler base class that..." \
+  --keywords "auth,journaler,handler" --tags "#architecture"
 
-# Find it later
-python3 bin/query.py --project myproject --keywords "auth"
+# Query later
+python3 bin/query.py --project myapp --keywords "auth"
 
-# Cheap summary (id, title, tags only)
-python3 bin/query.py --project myproject --keywords "auth" --summary
-
-# See current session
-python3 bin/query.py --project myproject --session
+# Summary only (cheap, just id/title/tags)
+python3 bin/query.py --project myapp --keywords "auth" --summary
 
 # List all projects
 python3 bin/list.py
 
-# Export memories (share with team)
-python3 bin/dump.py --project myproject
-python3 bin/dump.py --all           # Full backup
+# Check active session
+python3 bin/query.py --project myapp --session
 
-# Import memories
-python3 bin/devour.py --file shared_dump.txt --project myproject
+# Export to share
+python3 bin/dump.py --project myapp --output ~/myapp_dump.txt
+python3 bin/dump.py --all --output ~/full_backup.txt
 
-# Validate index
+# Import from teammate
+python3 bin/devour.py --file ~/teammate_dump.txt --project myapp --dry-run
+python3 bin/devour.py --file ~/teammate_dump.txt --project myapp --merge-strategy newest
+
+# Validate index health
 python3 bin/maintain.py --validate
+
+# Rebuild index from scratch
+python3 bin/maintain.py --rebuild
 ```
 
-## Files
+## Commands
 
-- `bin/init.py` - Setup + self-healing
-- `bin/store.py` - Save memories (--auto, --stdin, --no-fuzzy-dedup)
-- `bin/query.py` - Find memories (--summary, --limit, --since, --tag)
-- `bin/list.py` - List projects
-- `bin/archive.py` - Archive sessions
-- `bin/maintain.py` - Rebuild/validate/vacuum
-- `bin/migrate.py` - Schema changes
-- `bin/dump.py` - Export memories (--all for full backup)
-- `bin/devour.py` - Import memories
+| Command | Purpose | Key Flags |
+|---------|---------|-----------|
+| `init.py` | System setup & validation | `--force`, `--validate-only` |
+| `store.py` | Save memory | `--auto`, `--stdin`, `--type`, `--no-fuzzy-dedup`, `--dry-run` |
+| `query.py` | Retrieve memory | `--keywords`, `--tag`, `--session`, `--since`, `--recent`, `--summary`, `--full`, `--limit` |
+| `list.py` | Discover projects | `--type`, `--format` |
+| `archive.py` | Archive session | `--project` |
+| `maintain.py` | Index health | `--validate`, `--rebuild`, `--vacuum`, `--older-than` |
+| `migrate.py` | Schema migrations | `--from-version`, `--to-version`, `--dry-run` |
+| `dump.py` | Export memories | `--project`, `--all`, `--output`, `--format` |
+| `devour.py` | Import memories | `--file`, `--project`, `--merge-strategy` (skip\|overwrite\|newest), `--dry-run` |
 
 ## Sharing Workflow
 
-1. **Export**: `python bin/dump.py --project zap --output ~/shared/zap_dump.txt`
-2. **Share**: Send file via email/Confluence/Slack
-3. **Import**: `python bin/devour.py --file ~/Downloads/zap_dump.txt --project zap`
+### Single Project
+```bash
+# Alice exports
+python3 bin/dump.py --project shared_patterns --output patterns.txt
 
-Or full backup:
-1. **Export all**: `python bin/dump.py --all`
-2. **Import all**: `python bin/devour.py --file ALL_memoryDump.txt`
+# Bob imports (preview first)
+python3 bin/devour.py --file patterns.txt --project shared_patterns --dry-run
 
-## More
+# Bob commits import
+python3 bin/devour.py --file patterns.txt --project shared_patterns --merge-strategy newest
+```
 
-See [PLAN.md](./PLAN.md) for full details including implementation guide.
+### Full Backup (All Projects)
+```bash
+# Export everything
+python3 bin/dump.py --all --output team_backup_2024.txt
 
-## Reqs
+# Import everything (restores source project tracking)
+python3 bin/devour.py --file team_backup_2024.txt
+```
 
-- Python 3.6+
-- No packages needed
-- Works fully offline
+### Merge Strategies
+- **skip** — Keep existing entries, ignore imported duplicates
+- **overwrite** — Replace all with imported versions
+- **newest** — Update only if imported entry is newer (safe default)
+
+## Data Storage
+
+```
+~/.locked-in-claude/
+├── longterm/
+│   ├── index.json                    # Global inverted keyword index
+│   └── projects/{project}/memories.json
+│
+├── transient/
+│   └── projects/{project}/
+│       ├── session.json              # Active session
+│       └── sessions/{id}.json        # Archived sessions
+│
+└── locks/                            # POSIX file locks
+    └── {project}.lock
+```
+
+## Requirements
+
+- Python 3.6+ (stdlib only: hashlib, uuid, json, fcntl, datetime)
+- **No external packages**
+- Works fully offline in air-gapped networks
+- RHEL8, Ubuntu, macOS, any POSIX system
+
+## Status Codes
+
+All commands output `STATUS:` prefix:
+- `STATUS:OK` — Success
+- `STATUS:SKIP` — Skipped (duplicate, already exists)
+- `STATUS:WARN` — Succeeded with warnings
+- `STATUS:ERROR` — Failed
+- `STATUS:DRY` — Dry-run (no changes)
+
+Always check the status before consuming output.
+
+## Documentation
+
+- [PLAN.md](./PLAN.md) — Full technical specification (architecture, algorithms, data structures)
+- [CLAUDE.md](./CLAUDE.md) — Integration guide for Claude instances

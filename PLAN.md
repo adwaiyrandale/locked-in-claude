@@ -181,7 +181,7 @@ Each index entry now stores a SHA-256 checksum of the memories.json file. The va
 | bin/maintain.py | Index rebuild, validate, vacuum | `--rebuild`, `--validate`, `--vacuum`, `--older-than` |
 | bin/migrate.py | Run schema migrations | `--from-version`, `--to-version`, `--dry-run` |
 | bin/dump.py | Export memories to shareable file | `--project`, `--all`, `--output`, `--format` |
-| bin/devour.py | Import/ingest shared memories | `--file`, `--project`, `--merge` |
+| bin/devour.py | Import/ingest shared memories | `--file`, `--project`, `--merge-strategy` (skip\|overwrite\|newest), `--dry-run` |
 ### 4.2 init.py — Initialization & Startup Validation
 On every invocation, init.py runs a lightweight validate() pass before returning. This is the self-healing entry point.
 ```python
@@ -526,64 +526,119 @@ Dumps ALL project memories into a single file. Useful for:
 ```
 
 **bin/devour.py — Memory Import (Blue Lock: "The Devour"):**
-Import/ingest shared memories from a dump file. Prevents duplicates, updates existing entries if newer.
+Import/ingest shared memories from dump files with intelligent conflict resolution. Supports three merge strategies, dry-run preview, and full-dump restoration with source project tracking.
 
+**Flags:**
+- `--file` (required) — Path to dump file (JSON or TXT format)
+- `--project` (optional) — Target project (overrides dump file's project)
+- `--merge-strategy` (default: newest) — How to resolve conflicts:
+  - `skip` — Keep existing entries, ignore imported duplicates
+  - `overwrite` — Replace all entries with imported versions
+  - `newest` — Update only if imported entry is newer (safest default)
+- `--dry-run` — Preview import without making changes
+
+**Implementation:**
 ```python
-def devour_memory(file_path, project=None, merge=False):
-    """Import/ingest memories from a dump file."""
-    data = read_json(file_path)  # or parse from txt
+def devour_memory(file_path, project=None, merge_strategy="newest", dry_run=False):
+    """Import/ingest memories with configurable merge strategy."""
     
-    imported_project = data.get("project")
+    # Read and validate dump file (JSON or TXT format)
+    data = read_json(file_path) or parse_txt_dump(file_path)
+    
+    # Check if this is a --all dump (contains _source_project per entry)
+    is_all_dump = "_source_project" in data["entries"][0] if data.get("entries") else False
+    
     entries = data.get("entries", [])
-    
-    target_project = project or imported_project
-    
     imported_count = 0
     skipped_count = 0
     updated_count = 0
     
     for entry in entries:
-        # Check for duplicates by content hash
-        content_hash = entry.get("content_hash", "").replace("sha256:", "")
+        # For --all dumps, route each entry to its source project
+        if is_all_dump:
+            target_project = entry.get("_source_project")
+        else:
+            target_project = project or data.get("project")
         
-        existing = find_by_hash(target_project, content_hash)
-        if existing:
-            # Check if imported is newer
-            if parse_iso(entry.get("updated_at")) > parse_iso(existing.get("updated_at", "")):
-                update_entry(target_project, existing["id"], entry)
-                updated_count += 1
-            else:
-                skipped_count += 1
+        if not target_project:
             continue
         
-        # Check fuzzy duplicate
-        new_kws = set(entry.get("keywords", []))
-        fuzzy_match = find_fuzzy_duplicate(target_project, new_kws)
-        if fuzzy_match:
+        content_hash = entry.get("content_hash", "").replace("sha256:", "")
+        
+        # Step 1: Exact duplicate check (SHA-256)
+        existing = find_by_hash(target_project, content_hash)
+        if existing:
+            if merge_strategy == "skip":
+                skipped_count += 1
+            elif merge_strategy == "overwrite":
+                update_entry(target_project, existing["id"], entry)
+                updated_count += 1
+            else:  # newest (default)
+                imported_ts = parse_iso(entry.get("updated_at") or entry.get("created_at"))
+                existing_ts = parse_iso(existing.get("updated_at") or existing.get("created_at"))
+                if imported_ts > existing_ts:
+                    update_entry(target_project, existing["id"], entry)
+                    updated_count += 1
+                else:
+                    skipped_count += 1
+            continue
+        
+        # Step 2: Fuzzy duplicate check (Jaccard similarity on keywords)
+        keywords = normalize_keywords(entry.get("keywords", []))
+        fuzzy_match = find_fuzzy_duplicate(target_project, keywords)
+        if fuzzy_match and merge_strategy != "overwrite":
             skipped_count += 1
             continue
         
-        # Import new entry
-        add_entry(target_project, entry)
-        imported_count += 1
+        # Step 3: Import new entry (actual or dry-run)
+        if dry_run:
+            imported_count += 1
+        else:
+            add_entry(target_project, entry)
+            imported_count += 1
+            # Incremental index update (not full rebuild)
+            update_index_incremental(target_project, keywords)
     
-    # Rebuild index
-    rebuild_index()
-    
-    print(f"STATUS:OK imported={imported_count} updated={updated_count} skipped={skipped_count}")
+    status = "DRY" if dry_run else "OK"
+    print(f"STATUS:{status} imported={imported_count} updated={updated_count} skipped={skipped_count}")
     
     return {"imported": imported_count, "updated": updated_count, "skipped": skipped_count}
 ```
 
-**Sharing Workflow:**
-1. User A: `python bin/dump.py --project zap --output ~/Downloads/zap_memoryDump.txt`
-2. User A shares file via email/Confluence/Slack
-3. User B: `python bin/devour.py --file ~/Downloads/zap_memoryDump.txt --project zap`
+**Sharing Workflows:**
+
+*Single Project Import:*
+```bash
+# Alice exports project
+python3 bin/dump.py --project shared_patterns --output patterns_dump.txt
+
+# Bob previews (no changes)
+python3 bin/devour.py --file patterns_dump.txt --project shared_patterns --dry-run
+
+# Bob imports with merge strategy
+python3 bin/devour.py --file patterns_dump.txt --project shared_patterns --merge-strategy newest
+```
+
+*Full Backup (All Projects):*
+```bash
+# Export everything (includes _source_project per entry)
+python3 bin/dump.py --all --output team_backup.txt
+
+# Import (restores all projects with source tracking)
+python3 bin/devour.py --file team_backup.txt
+```
 
 **Conflict Resolution:**
-- Same content hash → skip (or update if newer)
-- Similar keywords (>85% Jaccard) → skip
-- New content → import as new entry
+| Scenario | Skip | Overwrite | Newest (Default) |
+|----------|------|-----------|------------------|
+| Exact hash match | Keep existing | Replace | Update if imported newer |
+| Fuzzy match (>85% Jaccard) | Skip | Replace | Keep existing |
+| New content | Import | Import | Import |
+
+**Incremental Index Updates (v2.0):**
+- Previously: Full index rebuild after each import (slow)
+- Now: Incremental `update_index_incremental()` per entry (fast)
+- Projects with large memory stores see O(n) → O(1) per-import improvement
 
 ---
 
@@ -1278,5 +1333,38 @@ python3 bin/query.py --project myproject --keywords "test"
 
 ---
 
-*Document Version: 2.1*
-*LockedInClaude*
+## Appendix A: Changelog
+
+### v2.0 Release (Current)
+**New Features:**
+- `--dry-run` flag for devour.py (preview imports without committing)
+- `--merge-strategy` flag for devour.py with three modes: skip, overwrite, newest
+- `--all` flag for dump.py (full backup with _source_project tracking per entry)
+- Incremental index updates in devour.py (O(1) per entry instead of O(n) full rebuild)
+- TXT format parsing for dump files (extract Hash, Keywords, Tags, Created/Updated)
+- File validation in devour.py (check dump structure before processing)
+
+**Bug Fixes:**
+- Fixed duplicate `store()` function definition that caused loss of `--stdin` and `--no-fuzzy-dedup` support
+- Removed orphaned Jaccard similarity code after for-loop in store.py
+- Verified FileLockWindows implementation (not present in codebase; POSIX flock used instead)
+
+**Breaking Changes:** None. v2.0 is backward-compatible with v1.0 dumps and projects.
+
+**Performance Improvements:**
+- Incremental index updates reduce devour time for large projects from O(n) to O(1) per entry
+- File validation prevents corrupted dumps from partially importing
+- Dry-run preview avoids unnecessary disk writes
+
+### v1.0 Release (Initial)
+- Two-tier memory architecture (longterm/transient)
+- Keyword search with stemming and stop-word filtering
+- Fuzzy deduplication via Jaccard similarity
+- POSIX file locking for concurrency
+- Self-healing index with checksums
+- Basic dump/devour for memory sharing
+
+---
+
+*Document Version: 2.2*
+*LockedInClaude - Local File-Based Context Memory for Claude*
