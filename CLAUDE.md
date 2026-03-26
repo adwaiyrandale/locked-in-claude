@@ -9,6 +9,16 @@ You have access to a local memory system at `~/.locked-in-claude/`. Works comple
 - `STATUS:ERROR` — Operation failed
 - `STATUS:DRY` — Dry-run preview (no changes made)
 
+## Critical Rules for Memory Operations
+
+**When importing memories from teammates (devour.py):**
+1. **ALWAYS use `--dry-run` first** to preview what will happen
+2. **Use `--merge-strategy newest` (default)** to preserve newer entries from either side
+3. **Never use `--merge-strategy overwrite`** unless explicitly told to replace all entries
+4. **Check STATUS:WARN** for skipped entries — they indicate duplicates or missing source project
+
+This prevents accidentally overwriting a teammate's newer memories on import.
+
 ## Quick Reference
 
 ### Store memories

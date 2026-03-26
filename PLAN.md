@@ -459,19 +459,27 @@ def run_migration(from_ver, to_ver, dry_run=False):
 Export memories to a shareable text file. Used when User A wants to share memories with User B.
 
 ```python
-def dump_memory(project=None, output_path=None, format="txt", all_projects=False):
+def dump_memory(project=None, output_path=None, format="txt", all_projects=False, exclude_projects=None):
     """Export project memories to a shareable file.
     
     Args:
         project: Single project name. If None and --all not set, error.
         all_projects: If True, dump ALL projects into one file.
+        exclude_projects: List of project names to exclude from --all dumps.
+                         Useful for excluding sensitive projects from team backups.
     """
+    if exclude_projects is None:
+        exclude_projects = []
+    
     if all_projects:
-        # Dump all projects
+        # Dump all projects (minus excluded)
         all_memories = []
         index = read_json(os.path.join(BASE_DIR, "longterm/index.json"))
         for entry in index.get("entries", []):
             proj = entry["project"]
+            if proj in exclude_projects:
+                print(f"STATUS:WARN skipping excluded project: {proj}")
+                continue
             proj_memories = read_all_memories(proj)
             for m in proj_memories:
                 m["_source_project"] = proj  # Tag with source
@@ -541,6 +549,12 @@ def devour_memory(file_path, project=None, merge_strategy="newest", dry_run=Fals
             target_project = entry.get("_source_project")
         else:
             target_project = project or data.get("project")
+        
+        # Silent skip: entry missing _source_project in --all dump
+        if not target_project:
+            print(f"STATUS:WARN skipped entry '{entry.get('title', 'unknown')}: _source_project missing'")
+            skipped_count += 1
+            continue
         
         if not target_project:
             continue
@@ -621,6 +635,98 @@ python3 bin/devour.py --file team_backup.txt
 - Previously: Full index rebuild after each import (slow)
 - Now: Incremental `update_index_incremental()` per entry (fast)
 - Projects with large memory stores see O(n) → O(1) per-import improvement
+
+**TXT Format Parser (Required for Implementation):**
+
+```python
+def parse_txt_dump(file_path):
+    """Parse TXT dump format into dict matching JSON dump structure.
+    
+    Args:
+        file_path: Path to TXT dump file
+        
+    Returns:
+        dict with keys: project, schema_version, entries[]
+        
+    Raises:
+        ValueError: If file is not a valid LockedInClaude dump
+    """
+    with open(file_path, "r") as f:
+        content = f.read()
+    
+    # Validate header
+    if "# LockedInClaude" not in content:
+        raise ValueError("Not a valid LockedInClaude dump file")
+    
+    # Parse header for project name
+    project = None
+    for line in content.split("\n"):
+        if line.startswith("# Project:"):
+            project = line.split(":", 1)[1].strip()
+            break
+    
+    # Split content into entries (separated by ---)
+    raw_entries = content.split("\n---\n")
+    entries = []
+    
+    for raw in raw_entries:
+        if not raw.strip() or raw.startswith("#"):
+            continue
+        
+        entry = {"keywords": [], "tags": []}
+        in_content = False
+        content_lines = []
+        
+        for line in raw.split("\n"):
+            # Skip header lines
+            if line.startswith("#"):
+                continue
+            
+            # Parse metadata
+            if line.startswith("**Type:**"):
+                parts = line.replace("**", "").split("|")
+                for p in parts:
+                    if "Type:" in p:
+                        entry["type"] = p.split(":")[1].strip()
+                    elif "ID:" in p:
+                        entry["id"] = p.split(":")[1].strip()
+            elif line.startswith("**Hash:**"):
+                entry["content_hash"] = line.replace("**", "").split(":")[1].strip()
+            elif line.startswith("**Keywords:**"):
+                kws = line.replace("**", "").split(":")[1].strip()
+                entry["keywords"] = [k.strip() for k in kws.split(",") if k.strip()]
+            elif line.startswith("**Tags:**"):
+                tags = line.replace("**", "").split(":")[1].strip()
+                entry["tags"] = [t.strip() for t in tags.split(",") if t.strip()]
+            elif line.startswith("**Created:**"):
+                entry["created_at"] = line.replace("**", "").split(":")[1].strip()
+            elif line.startswith("**Updated:**"):
+                entry["updated_at"] = line.replace("**", "").split(":")[1].strip()
+            elif line.startswith("## "):
+                # Extract title and optional [project] bracket
+                title_part = line[3:].strip()
+                if title_part.endswith("]"):
+                    bracket_start = title_part.rfind("[")
+                    if bracket_start > 0:
+                        entry["_source_project"] = title_part[bracket_start+1:-1]
+                        title_part = title_part[:bracket_start].strip()
+                entry["title"] = title_part
+            elif line.strip():
+                # Content line
+                content_lines.append(line)
+        
+        if content_lines:
+            entry["content"] = "\n".join(content_lines).strip()
+        
+        if entry.get("title"):
+            entries.append(entry)
+    
+    return {
+        "project": project,
+        "schema_version": "2.0",
+        "entries": entries
+    }
+```
 
 ---
 
@@ -1442,14 +1548,21 @@ python3 bin/query.py --project test2 --keywords "test" --summary
 # Corrupt memories.json
 echo "broken json" > ~/.locked-in-claude/longterm/projects/test/memories.json
 
-# Validate and heal
+# Validate and heal - detects corrupted file via checksum mismatch
 python3 bin/maintain.py --validate
-# Expected: STATUS:OK validate complete healed=1
+# Expected: STATUS:WARN project=test memories_corrupted=true
+# Expected: Then STATUS:OK validate complete healed=1
 
-# File should be restored or rebuilt
-python3 bin/query.py --project test --summary
-# Expected: STATUS:OK (or no entries if file was empty)
+# Remove corrupted file from index
+python3 bin/list.py --project test
+# Expected: No entries (corrupted file was removed from index)
 ```
+
+**Edge Case Detail:** When `reindex_project()` reads `memories.json` and encounters JSONDecodeError (corrupted file), it must:
+1. Catch the exception
+2. Emit `STATUS:WARN project=X memories_corrupted=true entries_lost=true`
+3. Remove the project from the index (don't crash)
+4. Continue validating other projects
 
 ### Test 5: Concurrent Access Simulation
 
@@ -1631,7 +1744,7 @@ TXT parsing extracts:
 
 ---
 
-## Appendix G: Performance Targets & Scaling
+## Appendix F: Performance Targets & Scaling
 
 ### Latency Targets
 
@@ -1663,7 +1776,7 @@ TXT parsing extracts:
 
 ---
 
-## Appendix H: Changelog
+## Appendix G: Changelog
 
 ### v2.0 Release (Current)
 **New Features:**
